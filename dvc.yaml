@@ -1,0 +1,7 @@
+stages:
+  data:
+    cmd: echo "Data ready"
+    deps:
+    - data/processed/complaints.parquet
+    outs:
+    - data/processed/complaints.parquet
