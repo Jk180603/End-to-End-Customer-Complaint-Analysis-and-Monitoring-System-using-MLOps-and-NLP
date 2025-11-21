@@ -3,101 +3,104 @@ import pandas as pd
 from transformers import pipeline
 import plotly.express as px
 from datetime import datetime
-import time
 
-# ------------------- MODEL (works without internet on Streamlit) -------------------
+# ------------------- MODEL -------------------
 @st.cache_resource
 def load_model():
     return pipeline(
         "text-classification",
-        model="lxyuan/distilbert-base-multilingual-cased-sentiments-student",
+        model="cardiffnlp/twitter-roberta-base-sentiment-latest",
         return_all_scores=True
     )
 
 classifier = load_model()
 
-# ------------------- APP LAYOUT -------------------
+# ------------------- CATEGORY & PRIORITY LOGIC -------------------
+def classify_category(text):
+    text = text.lower()
+    if any(k in text for k in ["account", "login", "password", "konto", "anmeldung"]):
+        return "Account"
+    elif any(k in text for k in ["delivery", "lieferung", "versand", "spät", "nicht angekommen", "paket"]):
+        return "Delivery"
+    elif any(k in text for k in ["defekt", "kaputt", "broken", "funktioniert nicht", "produkt"]):
+        return "Product Defect"
+    elif any(k in text for k in ["billing", "rechnung", "geld", "refund", "rückerstattung", "zahlung"]):
+        return "Billing"
+    else:
+        return "Other"
+
+def get_sentiment_and_priority(row):
+    result = classifier(row["Text"])[0]
+    scores = {x['label']: x['score'] for x in result}
+    sentiment = max(scores, key=scores.get)  # LABEL_POS, LABEL_NEU, LABEL_NEG
+    score = scores[sentiment]
+    
+    if sentiment == "LABEL_NEG" and score > 0.8:
+        priority = "High"
+    elif sentiment == "LABEL_NEG":
+        priority = "Medium"
+    else:
+        priority = "Low"
+        
+    return sentiment.replace("LABEL_", ""), round(score, 3), priority
+
+# ------------------- APP -------------------
 st.set_page_config(page_title="ComplaintPro", layout="wide")
-st.title("ComplaintPro – Real-Time Customer Complaint Analyzer")
-st.markdown("**Live classification • Sentiment • Category • Priority**")
+st.title("ComplaintPro – Live Customer Complaint Analytics")
+st.markdown("**Upload CSV → Auto-classify → Real-time Dashboard**")
 
-# Initialize history
-if "complaints" not in st.session_state:
-    st.session_state.complaints = pd.DataFrame(columns=["Text", "Sentiment", "Score", "Category", "Time"])
+# File uploader
+uploaded_file = st.file_uploader("Upload your complaints CSV (columns: 'Text')", type=["csv"])
 
-# Input box
-with st.form("complaint_form"):
-    user_input = st.text_area("Enter customer complaint (German/English):", height=120,
-                              placeholder="Beispiel: Die Lieferung ist zu spät und das Produkt ist kaputt...")
-    submitted = st.form_submit_button("Analyze Complaint")
+if uploaded_file:
+    df = pd.read_csv(uploaded_file)
+    
+    if "Text" not in df.columns:
+        st.error("CSV must have a column named 'Text'")
+        st.stop()
+    
+    with st.spinner("Classifying all complaints..."):
+        df["Category"] = df["Text"].apply(classify_category)
+        results = df["Text"].apply(get_sentiment_and_priority)
+        df[["Sentiment", "Confidence", "Priority"]] = pd.DataFrame(results.tolist(), index=df.index)
+        df["Time"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    
+    st.success(f"Successfully analyzed {len(df)} complaints!")
 
-# ------------------- ANALYSIS -------------------
-if submitted and user_input.strip():
-    with st.spinner("Analyzing complaint..."):
-        result = classifier(user_input)[0]
-        label = result['label']
-        score = result['score']
-        
-        # Map sentiment
-        sentiment_map = {"POSITIVE": "Positive", "NEGATIVE": "Negative", "NEUTRAL": "Neutral"}
-        sentiment = sentiment_map.get(label, label)
-        
-        # Simple category detection (you can extend with zero-shot later)
-        text = user_input.lower()
-        if any(word in text for word in ["lieferung", "versand", "spät", "nicht angekommen"]):
-            category = "Delivery Issue"
-        elif any(word in text for word in ["defekt", "kaputt", "funktioniert nicht"]):
-            category = "Product Defect"
-        elif any(word in text for word in ["geld", "rückerstattung", "rechnung"]):
-            category = "Billing/Refund"
-        else:
-            category = "General"
-
-        priority = "HIGH" if sentiment == "Negative" and score > 0.8 else "MEDIUM" if sentiment == "Negative" else "LOW"
-
-        new_row = pd.DataFrame([{
-            "Text": user_input,
-            "Sentiment": sentiment,
-            "Score": round(score, 3),
-            "Category": category,
-            "Priority": priority,
-            "Time": datetime.now().strftime("%H:%M:%S")
-        }])
-        st.session_state.complaints = pd.concat([st.session_state.complaints, new_row], ignore_index=True)
-
-# ------------------- LIVE DASHBOARD -------------------
-if not st.session_state.complaints.empty:
-    df = st.session_state.complaints.copy()
-
+    # Dashboard
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total Complaints", len(df))
-    col2.metric("Negative Today", len(df[df["Sentiment"] == "Negative"]))
-    col3.metric("High Priority", len(df[df["Priority"] == "HIGH"]))
-    col4.metric("Avg Sentiment Score", df[df["Sentiment"] == "Negative"]["Score"].mean().round(3) if len(df[df["Sentiment"] == "Negative"]) > 0 else 0)
+    col2.metric("Negative", len(df[df["Sentiment"] == "NEG"]))
+    col3.metric("High Priority", len(df[df["Priority"] == "High"]))
+    col4.metric("Most Common", df["Category"].mode()[0] if not df["Category"].empty else "-")
 
-    c1, c2 = st.columns([1.4, 1.6])
+    c1, c2 = st.columns(2)
 
     with c1:
-        st.subheader("Latest Complaints")
-        for _, row in df.tail(10).iterrows():
-            color = {"Negative": "#FF4444", "Neutral": "#CCCCCC", "Positive": "#00FF00"}[row["Sentiment"]]
-            st.markdown(f"**{row['Time']}** • <span style='color:{color}'>{row['Sentiment']} • {row['Priority']}</span>", unsafe_allow_html=True)
-            st.write(f"**{row['Category']}**")
-            st.caption(row["Text"][:150] + "..." if len(row["Text"]) > 150 else row["Text"])
-            st.divider()
+        st.subheader("Complaints by Category")
+        fig1 = px.bar(df["Category"].value_counts(), color=df["Category"].value_counts().index)
+        st.plotly_chart(fig1, use_container_width=True)
 
-    with c2:
-        st.subheader("Complaint Categories")
-        cat_count = df["Category"].value_counts()
-        fig = px.pie(values=cat_count.values, names=cat_count.index, color_discrete_sequence=px.colors.sequential.Reds)
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.subheader("Sentiment Over Time")
-        time_df = df.tail(20).copy()
-        time_df["Hour"] = pd.to_datetime(time_df["Time"], format="%H:%M:%S").dt.strftime("%H:%M")
-        fig2 = px.scatter(time_df, x="Hour", y="Score", color="Sentiment",
-                          size="Score", hover_data=["Text", "Category"])
+        st.subheader("Sentiment Distribution")
+        fig2 = px.pie(values=df["Sentiment"].value_counts().values,
+                      names=df["Sentiment"].value_counts().index,
+                      color_discrete_sequence=["#FF4444", "#FFD700", "#44FF44"])
         st.plotly_chart(fig2, use_container_width=True)
 
-st.success("COMPLAINT PRO LIVE – Ready for Audalaxy, Otto, Zalando")
-st.caption("Built by Jay Khakhar • github.com/JK180603 • 100% working on Streamlit Cloud")
+    with c2:
+        st.subheader("Priority Heatmap")
+        priority_df = df.groupby(["Category", "Priority"]).size().unstack(fill_value=0)
+        fig3 = px.imshow(priority_df.values,
+                         labels=dict(x="Priority", y="Category", color="Count"),
+                         x=priority_df.columns, y=priority_df.index,
+                         color_continuous_scale="Reds")
+        st.plotly_chart(fig3, use_container_width=True)
+
+        st.subheader("Latest 10 Complaints")
+        st.dataframe(df[["Text", "Category", "Sentiment", "Priority", "Confidence"]].head(10))
+
+    st.download_button("Download Results", df.to_csv(index=False).encode(), "complaints_analyzed.csv")
+
+else:
+    st.info("Upload a CSV with customer complaints to start analysis")
+    st.caption("Example column: 'Text' → 'Mein Konto funktioniert nicht und die Lieferung ist verspätet'")
