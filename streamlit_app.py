@@ -1,138 +1,131 @@
 import streamlit as st
-import pandas as pd
-from transformers import pipeline
-import plotly.express as px
+import requests
 import time
-from datetime import datetime
+import pandas as pd
+import plotly.express as px
+from wordcloud import WordCloud
+import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="Complaint Pro", layout="wide")
-st.title("End-to-End Customer Complaint Analysis & Monitoring System")
+# ------------------- PAGE CONFIG -------------------
+st.set_page_config(page_title="LIVE", layout="wide")
+st.title("COMPLAINTS FLYING IN — SENTIMENT FIXED ⚡")
 
-# Load models
-@st.cache_resource
-def load_models():
-    st.write("Waking up AI models... (first time ~40 sec)")
-    sentiment = pipeline("sentiment-analysis", model="cardiffnlp/twitter-roberta-base-sentiment-latest")
-    zero_shot = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
-    return sentiment, zero_shot
-
-sentiment_pipe, zero_shot_pipe = load_models()
-
-# BULLETPROOF SENTIMENT MAPPING — HANDLES ALL POSSIBLE OUTPUTS
-def get_sentiment_label(raw_label):
-    label = str(raw_label).lower()
-    if "neg" in label or "0" in label:
-        return "NEGATIVE"
-    elif "pos" in label or "2" in label:
-        return "POSITIVE"
-    else:
-        return "NEUTRAL"
-
-# SMART CATEGORY — fixes "Rechnung" → billing
-def smart_category(text):
-    text = text.lower()
-    if any(x in text for x in ["rechnung", "geld", "abbuchung", "rückerstattung", "zahlung", "kosten"]):
-        return "billing"
-    if any(x in text for x in ["lieferung", "paket", "versand", "dhl", "zustellung"]):
-        return "service"
-    if any(x in text for x in ["defekt", "kaputt", "funktioniert nicht"]):
-        return "product"
-    if any(x in text for x in ["konto", "login", "passwort", "anmeldung", "gesperrt"]):
-        return "account"
-    return "support"
-
-# Real German complaints
-complaints = [
-    "Rechnung kam doppelt – Geld abgebucht!",
-    "Produkt defekt, Display flackert",
-    "Lieferung 10 Tage verspätet – kein Tracking",
-    "Kundenservice antwortet nicht mehr",
-    "Konto gesperrt ohne Grund",
-    "Super schnelle Lieferung – top!",
-    "Login geht seit Update nicht",
-    "Wurde doppelt abgebucht – Rückerstattung?",
-    "Paket als zugestellt markiert aber nicht da",
-    "Sehr zufrieden – gerne wieder!"
-]
-
-# State
-if "done" not in st.session_state:
-    st.session_state.done = False
-    st.session_state.pos = st.session_state.neg = st.session_state.neu = 0
-    st.session_state.cat_count = {"billing":0, "support":0, "product":0, "service":0, "account":0}
-    st.session_state.neg_words = []
-
+# ------------------- UI PLACEHOLDERS -------------------
 live = st.empty()
 charts = st.empty()
 wc = st.empty()
-final = st.container()
+final = st.empty()
 
-i = 0
-while i < 20:
-    text = complaints[i % len(complaints)]
-    
-    # REAL SENTIMENT
-    raw_result = sentiment_pipe(text)[0]
-    raw_label = raw_result["label"]  # e.g., "negative", "LABEL_0", "NEGATIVE"
-    sentiment = get_sentiment_label(raw_label)
-    
-    if sentiment == "NEGATIVE":
-        st.session_state.neg += 1
-        st.session_state.neg_words.append(text)
-    elif sentiment == "POSITIVE":
-        st.session_state.pos += 1
-    else:
-        st.session_state.neu += 1
-    
-    # SMART CATEGORY
-    category = smart_category(text)
-    st.session_state.cat_count[category] += 1
+# ------------------- STATE -------------------
+sentiment_counts = {"pos":0, "neg":0, "neu":0}
+category_counts = {"billing":0, "support":0, "product":0, "service":0, "account":0}
+negative_words = []
 
-    # LIVE UPDATE
-    with live.container():
-        st.success(f"{i+1}/20 → {category.upper()} | {sentiment} | {text[:70]}...")
+# ------------------- LOAD DATA -------------------
+df = pd.read_parquet("complaintpro/data/processed/complaints.parquet").sample(20)
 
-    with charts.container():
-        col1, col2 = st.columns(2)
-        with col1:
-            fig_bar = px.bar(x=list(st.session_state.cat_count.keys()), 
-                           y=list(st.session_state.cat_count.values()),
-                           color_discrete_sequence=["#636EFA"])
-            st.plotly_chart(fig_bar, use_container_width=True)
-        with col2:
-            fig_pie = px.pie(values=[st.session_state.pos, st.session_state.neg, st.session_state.neu],
-                           names=["POSITIVE","NEGATIVE","NEUTRAL"],
-                           color_discrete_sequence=["#00CC96","#FF4444","#636EFA"])
-            st.plotly_chart(fig_pie, use_container_width=True)
+# ------------------- SENTIMENT NORMALIZATION -------------------
+def normalize_sent(s):
+    s = s.lower()
+    if "neg" in s:
+        return "neg"
+    elif "pos" in s:
+        return "pos"
+    return "neu"
 
-    # Negative word cloud
-    if len(st.session_state.neg_words) > 2:
-        from wordcloud import WordCloud
-        import matplotlib.pyplot as plt
-        cloud = WordCloud(width=600, height=300, background_color="black", colormap="Reds")\
-                .generate(" ".join(st.session_state.neg_words))
-        fig, ax = plt.subplots()
-        ax.imshow(cloud); ax.axis("off")
-        wc.pyplot(fig)
+# ------------------- LOOP -------------------
+for i, text in enumerate(df["clean_text"]):
+    try:
+        response = requests.post("http://localhost:8000/predict", json={"text": text})
+        data = response.json()
 
-    i += 1
-    time.sleep(2.3)
+        # Update live log
+        live.success(f"{i+1}/20 → {data['category'].upper()} | {data['sentiment']} | {data['text']}...")
 
-# FINAL
+        # Category count
+        cat = data["category"]
+        if cat in category_counts:
+            category_counts[cat] += 1
+
+        # Sentiment count
+        s = normalize_sent(data["sentiment"])
+        sentiment_counts[s] += 1
+
+        if s == "neg":
+            negative_words.append(data["text"])
+
+        # ------------------- UPDATE CHARTS -------------------
+        with charts.container():
+            c1, c2 = st.columns(2)
+
+            # Category chart
+            c1.plotly_chart(
+                px.bar(
+                    x=list(category_counts.keys()),
+                    y=list(category_counts.values()),
+                    title="Live Categories"
+                ),
+                use_container_width=True
+            )
+
+            # Sentiment pie
+            c2.plotly_chart(
+                px.pie(
+                    names=["Positive", "Negative", "Neutral"],
+                    values=[
+                        sentiment_counts["pos"],
+                        sentiment_counts["neg"],
+                        sentiment_counts["neu"],
+                    ],
+                    title="Live Sentiment",
+                    color_discrete_sequence=["#00CC96", "#FF4444", "#636EFA"]
+                ),
+                use_container_width=True
+            )
+
+        # ------------------- WORD CLOUD -------------------
+        if len(negative_words) > 2:
+            cloud = WordCloud(
+                width=400, height=300, background_color="black", colormap="Reds"
+            ).generate(" ".join(negative_words))
+
+            fig, ax = plt.subplots()
+            ax.imshow(cloud)
+            ax.axis("off")
+            wc.pyplot(fig)
+
+        time.sleep(1.5)
+
+    except Exception as e:
+        print("Error:", e)
+        time.sleep(1)
+
+# ------------------- FINAL SUMMARY -------------------
 with final.container():
     st.balloons()
     st.success("20 COMPLAINTS ANALYZED!")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total", 20)
-    col2.metric("Positive", st.session_state.pos)
-    col3.metric("Negative", st.session_state.neg)
+
+    total = sum(sentiment_counts.values())
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total", total)
+    c2.metric("Positive", sentiment_counts["pos"])
+    c3.metric("Negative", sentiment_counts["neg"])
 
     st.subheader("FINAL CATEGORIES")
-    st.plotly_chart(px.bar(x=list(st.session_state.cat_count.keys()), y=list(st.session_state.cat_count.values())))
+    st.plotly_chart(
+        px.bar(x=list(category_counts.keys()), y=list(category_counts.values()))
+    )
 
     st.subheader("FINAL SENTIMENT")
-    st.plotly_chart(px.pie(values=[st.session_state.pos, st.session_state.neg, st.session_state.neu],
-                           names=["POSITIVE","NEGATIVE","NEUTRAL"],
-                           color_discrete_sequence=["#00CC96","#FF4444","#636EFA"]))
-
-    st.caption("100% FIXED: neg/NEG/LABEL_0 → NEGATIVE | Rechnung → billing • Jay Khakhar")
+    st.plotly_chart(
+        px.pie(
+            names=["Positive", "Negative", "Neutral"],
+            values=[
+                sentiment_counts["pos"],
+                sentiment_counts["neg"],
+                sentiment_counts["neu"],
+            ],
+            color_discrete_sequence=["#00CC96", "#FF4444", "#636EFA"]
+        )
+    )
