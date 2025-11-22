@@ -36,7 +36,7 @@ real_complaints = [
 ]
 
 # Add more real ones if you want
-]
+
 
 # State
 if "processed" not in st.session_state:
