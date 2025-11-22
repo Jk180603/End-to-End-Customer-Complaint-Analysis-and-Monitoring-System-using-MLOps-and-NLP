@@ -1,159 +1,115 @@
 import streamlit as st
-import pandas as pd
 import requests
-import time
-import re
-from datetime import datetime
 from transformers import pipeline
-import plotly.express as px
 
-st.set_page_config(page_title="Complaint Pro", layout="wide")
-st.title("Real-Time Customer Complaint Monitoring (AI Powered)")
+st.title("Live Complaint Classifier")
 
-# ----------------------------------------------------------
-# LOAD REAL AI MODELS (cached so they load only once)
-# ----------------------------------------------------------
-@st.cache_resource
-def load_models():
-    sentiment_model = pipeline("sentiment-analysis")   # REAL SENTIMENT
-    category_model = pipeline(
-        "zero-shot-classification",
-        model="facebook/bart-large-mnli"
-    )  # REAL CATEGORY
-    return sentiment_model, category_model
+# --- Load sentiment model ---
+sentiment_model = pipeline("sentiment-analysis")
 
-sentiment_model, category_model = load_models()
+# Categories (fallback)
+CATEGORIES = ["delivery", "product", "service", "payment", "refund"]
 
-# ----------------------------------------------------------
-# SESSION STATE STORAGE
-# ----------------------------------------------------------
-if "df" not in st.session_state:
-    st.session_state.df = pd.DataFrame(
-        columns=["time", "complaint", "category", "sentiment"]
-    )
+# Fake classifier for category (only temporary)
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import torch
 
-placeholder = st.empty()
+tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+model = AutoModelForSequenceClassification.from_pretrained(
+    "distilbert-base-uncased",
+    num_labels=len(CATEGORIES)
+)
 
-# ----------------------------------------------------------
-# GET REAL AMAZON REVIEW
-# ----------------------------------------------------------
-def fetch_review():
-    """
-    Extracts real Amazon.de review text from public proxy (no CORS).
-    Falls back only if website blocks request temporarily.
-    """
+def classify_category(text):
+    """Temporary text classification to distinguish categories"""
+    inputs = tokenizer(text, return_tensors="pt", truncation=True)
+    logits = model(**inputs).logits
+    pred = torch.argmax(logits, dim=1).item()
+    return CATEGORIES[pred]
+
+# -------------------------------------------------------------------
+# 🔥 FETCH DATA FROM API + DEBUG LOGGING (MOST IMPORTANT PART)
+# -------------------------------------------------------------------
+API_URL = "http://127.0.0.1:8000/get-complaints"  # your API URL
+
+def fetch_api_data():
     try:
-        url = "https://api.allorigins.win/raw?url=https://www.amazon.de/product-reviews/random"
-        resp = requests.get(url, timeout=10)
+        response = requests.get(API_URL)
 
-        if resp.status_code == 200:
-            html = resp.text
+        # parse response
+        data = response.json()
 
-            # extract the review text
-            match = re.search(r'review-text-content[^>]*>(.*?)</span>', html, re.DOTALL)
-            if match:
-                clean = re.sub(r"<.*?>", "", match.group(1)).strip()
-                if len(clean) > 15:
-                    return clean
-    except:
-        pass
+        # 🔥 DEBUG PRINTS — THIS WILL SOLVE THE ISSUE 🔥
+        print("\n\n========= RAW API RESPONSE =========")
+        print(data)
+        print("====================================\n")
 
-    # fallback sample (only used if review can't be fetched)
-    return "Die Lieferung war verspätet, aber die Produktqualität ist hervorragend."
+        st.write("DEBUG API RESPONSE:", data)
 
-
-# ----------------------------------------------------------
-# TRUE CATEGORY USING ZERO-SHOT MODEL
-# ----------------------------------------------------------
-def get_category(text):
-    labels = ["Delivery", "Product", "Billing", "Account", "Support"]
-    result = category_model(text, labels)
-    return result["labels"][0]  # highest score
+        return data
+    except Exception as e:
+        st.error(f"Error fetching API data: {e}")
+        return []
+# -------------------------------------------------------------------
 
 
-# ----------------------------------------------------------
-# TRUE SENTIMENT USING TRANSFORMER MODEL
-# ----------------------------------------------------------
-def get_sentiment(text):
-    result = sentiment_model(text)[0]["label"].upper()
-    if result == "NEGATIVE":
-        return "Negative"
-    elif result == "POSITIVE":
-        return "Positive"
-    else:
-        return "Neutral"
+# -------------------------------------------------------------------
+# 🔥 PROCESS EACH COMPLAINT
+# -------------------------------------------------------------------
+def process_complaints(data):
+    processed_list = []
+
+    for item in data:
+
+        # -----------------------------------------------
+        # 1) Detect where the review text is actually stored
+        # -----------------------------------------------
+        text = None
+
+        POSSIBLE_KEYS = ["review", "message", "comment", "text", "body", "content"]
+
+        for k in POSSIBLE_KEYS:
+            if k in item and isinstance(item[k], str):
+                text = item[k]
+                break
+
+        # if nothing found
+        if not text:
+            text = str(item)  # last fallback
+
+        # -----------------------------------------------
+        # 2) DEBUG: show extracted text
+        # -----------------------------------------------
+        print("\nExtracted Text:", text)
+        st.write("Extracted Text:", text)
+
+        # -----------------------------------------------
+        # 3) SENTIMENT CLASSIFICATION
+        # -----------------------------------------------
+        sentiment = sentiment_model(text)[0]
+        sentiment_label = sentiment['label']  # POSITIVE / NEGATIVE / NEUTRAL
+
+        # -----------------------------------------------
+        # 4) CATEGORY CLASSIFICATION
+        # -----------------------------------------------
+        category = classify_category(text)
+
+        processed_list.append({
+            "text": text,
+            "sentiment": sentiment_label,
+            "category": category
+        })
+
+    return processed_list
 
 
-# ----------------------------------------------------------
-# MAIN LOOP (RUNS EVERY 8 SECONDS)
-# ----------------------------------------------------------
-while True:
-    time.sleep(8)
+# -------------------------------------------------------------------
+# 🔥 MAIN PROCESSING
+# -------------------------------------------------------------------
+data = fetch_api_data()
 
-    # 1️⃣ FETCH REAL REVIEW
-    review = fetch_review()
+if data:
+    result = process_complaints(data)
 
-    # 2️⃣ AI CLASSIFICATION
-    category = get_category(review)
-    sentiment = get_sentiment(review)
-
-    # 3️⃣ STORE LAST 20 RECORDS
-    new_row = pd.DataFrame([{
-        "time": datetime.now().strftime("%H:%M:%S"),
-        "complaint": review,
-        "category": category,
-        "sentiment": sentiment
-    }])
-
-    st.session_state.df = pd.concat(
-        [st.session_state.df, new_row],
-        ignore_index=True
-    ).tail(20)
-
-    df = st.session_state.df.copy()
-
-    # ------------------------------------------------------
-    # UI UPDATE
-    # ------------------------------------------------------
-    with placeholder.container():
-
-        total = len(df)
-        pos = len(df[df["sentiment"] == "Positive"])
-        neg = len(df[df["sentiment"] == "Negative"])
-        neu = len(df[df["sentiment"] == "Neutral"])
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total Reviews", total)
-        c2.metric("Positive", pos)
-        c3.metric("Negative", neg)
-        c4.metric("Neutral", neu)
-
-        st.success(f"{total} REAL AMAZON REVIEWS ANALYZED LIVE")
-
-        col1, col2 = st.columns(2)
-
-        # CATEGORY BAR
-        with col1:
-            st.subheader("AI Category Classification")
-            order = ["Delivery", "Product", "Billing", "Account", "Support"]
-            bar_data = df["category"].value_counts().reindex(order, fill_value=0)
-            st.bar_chart(bar_data, height=400)
-
-        # SENTIMENT PIE
-        with col2:
-            st.subheader("AI Sentiment Classification")
-            sent_counts = df["sentiment"].value_counts()
-            fig = px.pie(
-                pd.DataFrame({"Sentiment": sent_counts.index, "Count": sent_counts.values}),
-                values="Count",
-                names="Sentiment",
-                color="Sentiment",
-                color_discrete_map={
-                    "Negative": "#FF4444",
-                    "Positive": "#44FF44",
-                    "Neutral": "#4477FF"
-                }
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-        st.caption("Real Amazon Reviews → AI Category + AI Sentiment • By Jay Khakhar")
+    st.subheader("Processed Complaints")
+    st.write(result)
