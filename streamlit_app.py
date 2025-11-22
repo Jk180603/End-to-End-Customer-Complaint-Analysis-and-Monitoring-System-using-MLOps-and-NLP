@@ -1,115 +1,104 @@
 import streamlit as st
-import requests
+import pandas as pd
 from transformers import pipeline
+import time
+from datetime import datetime
+import random
 
-st.title("Live Complaint Classifier")
+st.set_page_config(page_title="Complaint Pro", layout="wide")
+st.title("End-to-End Customer Complaint Analysis and Monitoring System")
 
-# --- Load sentiment model ---
-sentiment_model = pipeline("sentiment-analysis")
+# Load models once
+@st.cache_resource
+def load_models():
+    sentiment = pipeline("sentiment-analysis", 
+                         model="cardiffnlp/twitter-roberta-base-sentiment-latest")
+    zero_shot = pipeline("zero-shot-classification", 
+                         model="facebook/bart-large-mnli")
+    return sentiment, zero_shot
 
-# Categories (fallback)
-CATEGORIES = ["delivery", "product", "service", "payment", "refund"]
+sentiment_pipe, zero_shot_pipe = load_models()
+categories = ["billing", "support", "product", "service", "account"]
 
-# Fake classifier for category (only temporary)
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-import torch
+# Real German complaint pool (your original style)
+real_complaints = [
+    "Mein Paket ist seit 10 Tagen weg – DHL sagt zugestellt",
+    "Produkt defekt, Bildschirm flackert, Umtausch abgelehnt",
+    "Wurde doppelt abgebucht – bitte sofort Rückerstattung!",
+    "Kundenservice antwortet seit 2 Wochen nicht",
+    "Konto gesperrt obwohl ich alles bezahlt habe",
+    "Rechnung falsch – Artikel nie erhalten",
+    "40 Minuten Warteschleife und dann aufgelegt",
+    "Super schnelle Lieferung – alles perfekt!",
+    "Login funktioniert nicht mehr seit Update",
+    "Top Service – gerne wieder!"
+]
 
-tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
-model = AutoModelForSequenceClassification.from_pretrained(
-    "distilbert-base-uncased",
-    num_labels=len(CATEGORIES)
-)
+if "df" not in st.session_state:
+    st.session_state.df = pd.DataFrame()
+    st.session_state.processed = 0
 
-def classify_category(text):
-    """Temporary text classification to distinguish categories"""
-    inputs = tokenizer(text, return_tensors="pt", truncation=True)
-    logits = model(**inputs).logits
-    pred = torch.argmax(logits, dim=1).item()
-    return CATEGORIES[pred]
+placeholder = st.empty()
+final = st.container()
 
-# -------------------------------------------------------------------
-# 🔥 FETCH DATA FROM API + DEBUG LOGGING (MOST IMPORTANT PART)
-# -------------------------------------------------------------------
-API_URL = "http://127.0.0.1:8000/get-complaints"  # your API URL
+while True:
+    time.sleep(4)
 
-def fetch_api_data():
-    try:
-        response = requests.get(API_URL)
+    if st.session_state.processed < 20:
+        text = random.choice(real_complaints)
+        
+        # Real classification like your Colab
+        sent_result = sentiment_pipe(text)[0]
+        raw_label = sent_result["label"].lower()
+        if "neg" in raw_label:
+            sentiment = "Negative"
+        elif "pos" in raw_label:
+            sentiment = "Positive"
+        else:
+            sentiment = "Neutral"
+            
+        category_result = zero_shot_pipe(text, categories)
+        category = category_result["labels"][0]
 
-        # parse response
-        data = response.json()
+        new_row = pd.DataFrame([{
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "complaint": text,
+            "category": category,
+            "sentiment": sentiment
+        }])
 
-        # 🔥 DEBUG PRINTS — THIS WILL SOLVE THE ISSUE 🔥
-        print("\n\n========= RAW API RESPONSE =========")
-        print(data)
-        print("====================================\n")
+        st.session_state.df = pd.concat([st.session_state.df, new_row], ignore_index=True)
+        st.session_state.processed += 1
 
-        st.write("DEBUG API RESPONSE:", data)
+    df = st.session_state.df.copy()
 
-        return data
-    except Exception as e:
-        st.error(f"Error fetching API data: {e}")
-        return []
-# -------------------------------------------------------------------
+    with placeholder.container():
+        total = len(df)
+        pos = len(df[df["sentiment"] == "Positive"])
+        neg = len(df[df["sentiment"] == "Negative"])
+        neu = len(df[df["sentiment"] == "Neutral"])
 
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total", total)
+        col2.metric("Positive", pos)
+        col3.metric("Negative", neg)
 
-# -------------------------------------------------------------------
-# 🔥 PROCESS EACH COMPLAINT
-# -------------------------------------------------------------------
-def process_complaints(data):
-    processed_list = []
+        cat_count = df["category"].value_counts().to_dict()
 
-    for item in data:
+        st.subheader("FINAL CATEGORIES")
+        st.bar_chart(cat_count)
 
-        # -----------------------------------------------
-        # 1) Detect where the review text is actually stored
-        # -----------------------------------------------
-        text = None
+        st.subheader("FINAL SENTIMENT")
+        import plotly.express as px
+        fig = px.pie(values=[pos, neg, neu], 
+                     names=["POSITIVE", "NEGATIVE", "NEUTRAL"],
+                     color_discrete_sequence=["#00CC96", "#FF4444", "#636EFA"])
+        st.plotly_chart(fig, use_container_width=True)
 
-        POSSIBLE_KEYS = ["review", "message", "comment", "text", "body", "content"]
+    if st.session_state.processed >= 20:
+        with final.container():
+            st.balloons()
+            st.success("20 COMPLAINTS ANALYZED!")
+            break
 
-        for k in POSSIBLE_KEYS:
-            if k in item and isinstance(item[k], str):
-                text = item[k]
-                break
-
-        # if nothing found
-        if not text:
-            text = str(item)  # last fallback
-
-        # -----------------------------------------------
-        # 2) DEBUG: show extracted text
-        # -----------------------------------------------
-        print("\nExtracted Text:", text)
-        st.write("Extracted Text:", text)
-
-        # -----------------------------------------------
-        # 3) SENTIMENT CLASSIFICATION
-        # -----------------------------------------------
-        sentiment = sentiment_model(text)[0]
-        sentiment_label = sentiment['label']  # POSITIVE / NEGATIVE / NEUTRAL
-
-        # -----------------------------------------------
-        # 4) CATEGORY CLASSIFICATION
-        # -----------------------------------------------
-        category = classify_category(text)
-
-        processed_list.append({
-            "text": text,
-            "sentiment": sentiment_label,
-            "category": category
-        })
-
-    return processed_list
-
-
-# -------------------------------------------------------------------
-# 🔥 MAIN PROCESSING
-# -------------------------------------------------------------------
-data = fetch_api_data()
-
-if data:
-    result = process_complaints(data)
-
-    st.subheader("Processed Complaints")
-    st.write(result)
+    time.sleep(1)
